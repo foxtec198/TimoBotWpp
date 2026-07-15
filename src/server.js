@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 
 const cors = require('cors');
 const express = require('express');
@@ -47,6 +47,8 @@ let lastState = 'starting';
 let authenticatedAt = null;
 let readyAt = null;
 let lastError = null;
+let initializeAttempts = 0;
+let initializing = false;
 
 app.use(cors());
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
@@ -56,7 +58,7 @@ app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
 
 //   const token = req.get('x-api-key') || req.query.api_key;
 //   if (token !== API_KEY) {
-//     return res.status(401).json({ ok: false, error: 'API key inválida ou ausente.' });
+//     return res.status(401).json({ ok: false, error: 'API key invÃ¡lida ou ausente.' });
 //   }
 
 //   return next();
@@ -187,12 +189,12 @@ async function buildMedia(image) {
 
 async function sendQueuedMessage(payload) {
   if (!clientReady) {
-    throw new Error('WhatsApp ainda não está conectado.');
+    throw new Error('WhatsApp ainda nÃ£o estÃ¡ conectado.');
   }
 
   const chatId = await resolveChatId(payload.destination);
   if (!chatId) {
-    throw new Error('Número não encontrado no WhatsApp ou não resolvido pelo WhatsApp Web.');
+    throw new Error('NÃºmero nÃ£o encontrado no WhatsApp ou nÃ£o resolvido pelo WhatsApp Web.');
   }
 
   const media = await buildMedia(payload.image);
@@ -245,7 +247,7 @@ client.on('qr', async (qr) => {
 
   console.log('\nEscaneie este QR Code com o WhatsApp:');
   qrcodeTerminal.generate(qr, { small: true });
-  console.log(`\nTambém disponível em http://${HOST}:${PORT}/qr\n`);
+  console.log(`\nTambÃ©m disponÃ­vel em http://${HOST}:${PORT}/qr\n`);
 });
 
 client.on('authenticated', () => {
@@ -268,8 +270,8 @@ client.on('ready', () => {
 client.on('auth_failure', (message) => {
   clientReady = false;
   lastState = 'auth_failure';
-  lastError = message || 'Falha de autenticação.';
-  console.error('Falha de autenticação:', lastError);
+  lastError = message || 'Falha de autenticaÃ§Ã£o.';
+  console.error('Falha de autenticaÃ§Ã£o:', lastError);
 });
 
 client.on('disconnected', (reason) => {
@@ -278,6 +280,46 @@ client.on('disconnected', (reason) => {
   lastError = reason || null;
   console.warn('WhatsApp desconectado:', reason);
 });
+
+function shouldRetryInitialize(error) {
+  const message = String(error?.message || '');
+
+  return [
+    'Execution context was destroyed',
+    'Most likely because of a navigation',
+    'Target closed',
+    'Protocol error',
+    'Navigation timeout'
+  ].some((pattern) => message.includes(pattern));
+}
+
+function initializeClientWithRetry() {
+  if (initializing || clientReady) {
+    return;
+  }
+
+  initializing = true;
+  initializeAttempts += 1;
+  lastState = 'initializing';
+
+  console.log(`Inicializando cliente WhatsApp... tentativa ${initializeAttempts}`);
+
+  client.initialize().catch((error) => {
+    clientReady = false;
+    initializing = false;
+    lastState = 'initialize_error';
+    lastError = error.message;
+    console.error('Falha ao inicializar WhatsApp:', error);
+
+    if (!shouldRetryInitialize(error)) {
+      return;
+    }
+
+    const delayMs = Math.min(30000, 5000 * initializeAttempts);
+    console.log(`Tentando inicializar novamente em ${delayMs / 1000}s...`);
+    setTimeout(initializeClientWithRetry, delayMs);
+  });
+}
 
 app.get('/', (req, res) => {
   const status = publicStatus();
@@ -316,7 +358,7 @@ app.get('/', (req, res) => {
       <head><meta charset="utf-8"><title>WhatsApp Listener</title></head>
       <body>
         <h1>WhatsApp iniciando</h1>
-        <p>Aguardando geração do QR Code. Recarregue esta página em alguns segundos.</p>
+        <p>Aguardando geraÃ§Ã£o do QR Code. Recarregue esta pÃ¡gina em alguns segundos.</p>
         <pre>${JSON.stringify(status, null, 2)}</pre>
       </body>
     </html>
@@ -332,7 +374,7 @@ app.get('/qr', (req, res) => {
     return res.status(clientReady ? 409 : 404).json({
       ok: false,
       connected: clientReady,
-      error: clientReady ? 'WhatsApp já está conectado.' : 'QR Code ainda não foi gerado.'
+      error: clientReady ? 'WhatsApp jÃ¡ estÃ¡ conectado.' : 'QR Code ainda nÃ£o foi gerado.'
     });
   }
 
@@ -401,7 +443,7 @@ app.get('/queue/:id', async (req, res) => {
   try {
     const job = await getMessageJob(req.params.id);
     if (!job) {
-      return res.status(404).json({ ok: false, error: 'Job não encontrado.' });
+      return res.status(404).json({ ok: false, error: 'Job nÃ£o encontrado.' });
     }
     return res.json({ ok: true, job });
   } catch (error) {
@@ -409,72 +451,13 @@ app.get('/queue/:id', async (req, res) => {
   }
 });
 
-app.post(['/send', '/enviar'], async (req, res) => {
-  if (!clientReady) {
-    return res.status(409).json({
-      ok: false,
-      error: 'WhatsApp ainda não está conectado. Abra / para escanear o QR Code.',
-      status: publicStatus()
-    });
-  }
-
-  const { to, numero, phone, message, mensagem, text } = req.body || {};
-  const destination = to || numero || phone;
-  const body = message || mensagem || text;
-
-  if (!buildChatId(destination)) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Informe o destino em "to", "numero" ou "phone". Exemplo: 5511999999999.'
-    });
-  }
-
-  if (!body || !String(body).trim()) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Informe a mensagem em "message", "mensagem" ou "text".'
-    });
-  }
-
-  try {
-    const chatId = await resolveChatId(destination);
-    if (!chatId) {
-      return res.status(404).json({
-        ok: false,
-        error: 'Número não encontrado no WhatsApp ou não resolvido pelo WhatsApp Web.',
-        details: 'Confira se o número existe no WhatsApp e se está no formato DDI + DDD + número, exemplo: 5511999999999.'
-      });
-    }
-
-    const result = await client.sendMessage(chatId, String(body));
-    return res.json({
-      ok: true,
-      to: chatId,
-      sent: Boolean(result),
-      messageId: result?.id?._serialized || null
-    });
-  } catch (error) {
-    lastError = error.message;
-    return res.status(500).json({
-      ok: false,
-      error: 'Falha ao enviar mensagem.',
-      details: error.message
-    });
-  }
-});
 
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: 'Rota não encontrada.' });
+  res.status(404).json({ ok: false, error: 'Rota nÃ£o encontrada.' });
 });
 
 app.listen(PORT, HOST, () => {
   console.log(`Servidor HTTP rodando em http://${HOST}:${PORT}`);
   initMessageQueue(sendQueuedMessage);
-  console.log('Inicializando cliente WhatsApp...');
-  client.initialize().catch((error) => {
-    clientReady = false;
-    lastState = 'initialize_error';
-    lastError = error.message;
-    console.error('Falha ao inicializar WhatsApp:', error);
-  });
+  initializeClientWithRetry();
 });
