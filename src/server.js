@@ -19,6 +19,10 @@ const API_KEY = process.env.API_KEY || '';
 const HEADLESS = String(process.env.PUPPETEER_HEADLESS || 'true') !== 'false';
 const WA_INITIALIZE_TIMEOUT_MS = Number(process.env.WA_INITIALIZE_TIMEOUT_MS || 90000);
 const PUPPETEER_NAVIGATION_TIMEOUT_MS = Number(process.env.PUPPETEER_NAVIGATION_TIMEOUT_MS || 120000);
+const WA_AUTH_TIMEOUT_MS = Number(process.env.WA_AUTH_TIMEOUT_MS || 120000);
+const WA_WEB_VERSION = process.env.WA_WEB_VERSION || '';
+const WA_WEB_VERSION_CACHE = process.env.WA_WEB_VERSION_CACHE || '';
+const WA_WEB_VERSION_REMOTE_PATH = process.env.WA_WEB_VERSION_REMOTE_PATH || 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html';
 
 function detectChromeExecutablePath() {
   const configured = process.env.CHROME_EXECUTABLE_PATH;
@@ -227,8 +231,9 @@ async function sendQueuedMessage(payload) {
 }
 
 function createWhatsAppClient() {
-  const createdClient = new Client({
+  const clientOptions = {
     authStrategy: new LocalAuth(),
+    authTimeoutMs: WA_AUTH_TIMEOUT_MS,
     takeoverOnConflict: true,
     takeoverTimeoutMs: 0,
     puppeteer: {
@@ -252,7 +257,25 @@ function createWhatsAppClient() {
         '--mute-audio'
       ]
     }
-  });
+  };
+
+  if (WA_WEB_VERSION) {
+    clientOptions.webVersion = WA_WEB_VERSION;
+  }
+
+  if (WA_WEB_VERSION_CACHE === 'remote') {
+    clientOptions.webVersionCache = {
+      type: 'remote',
+      remotePath: WA_WEB_VERSION_REMOTE_PATH,
+      strict: false
+    };
+  } else if (WA_WEB_VERSION_CACHE === 'local') {
+    clientOptions.webVersionCache = {
+      type: 'local'
+    };
+  }
+
+  const createdClient = new Client(clientOptions);
 
   createdClient.on('qr', async (qr) => {
     lastQr = qr;

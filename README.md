@@ -31,6 +31,12 @@ PORT=3000
 HOST=127.0.0.1
 API_KEY=troque-essa-chave
 PUPPETEER_HEADLESS=true
+WA_INITIALIZE_TIMEOUT_MS=90000
+PUPPETEER_NAVIGATION_TIMEOUT_MS=120000
+WA_AUTH_TIMEOUT_MS=120000
+WA_WEB_VERSION=
+WA_WEB_VERSION_CACHE=
+WA_WEB_VERSION_REMOTE_PATH=https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html
 CHROME_EXECUTABLE_PATH=
 QUEUE_DRIVER=memory
 REDIS_URL=redis://127.0.0.1:6379
@@ -54,7 +60,7 @@ Se `API_KEY` ficar preenchida, chamadas de envio precisam enviar o header `x-api
 - `GET /queue`: status da fila.
 - `GET /queue/:id`: status de um job.
 
-Se `REDIS_URL` estiver configurado e `bullmq`/`ioredis` instalados, a fila usa Redis e sobrevive a restart. Sem Redis, o servidor usa fila em memória para desenvolvimento.
+Com `QUEUE_DRIVER=memory`, a fila usa memória local para desenvolvimento. Para persistir fila em Redis, configure `QUEUE_DRIVER=redis` e `REDIS_URL`.
 
 ## Envio
 
