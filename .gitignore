@@ -141,3 +141,19 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# WhatsApp Web local session/cache
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Python local tests
+ptn/venv/
+ptn/__pycache__/
+ptn/face_db/
+ptn/registry_db/
+ptn/.env
+ptn/.env.*
+!ptn/.env.example
+ptn/tools/
+tools/
+*.pyc
