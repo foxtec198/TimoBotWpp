@@ -17,6 +17,8 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
 const API_KEY = process.env.API_KEY || '';
 const HEADLESS = String(process.env.PUPPETEER_HEADLESS || 'true') !== 'false';
+const WA_INITIALIZE_TIMEOUT_MS = Number(process.env.WA_INITIALIZE_TIMEOUT_MS || 90000);
+const PUPPETEER_NAVIGATION_TIMEOUT_MS = Number(process.env.PUPPETEER_NAVIGATION_TIMEOUT_MS || 120000);
 
 function detectChromeExecutablePath() {
   const configured = process.env.CHROME_EXECUTABLE_PATH;
@@ -47,8 +49,10 @@ let lastState = 'starting';
 let authenticatedAt = null;
 let readyAt = null;
 let lastError = null;
+let lastClientState = null;
 let initializeAttempts = 0;
 let initializing = false;
+let client = null;
 
 app.use(cors());
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
@@ -116,6 +120,7 @@ function publicStatus() {
     hasQr: Boolean(lastQr),
     authenticatedAt,
     readyAt,
+    lastClientState,
     lastError
   };
 }
@@ -221,65 +226,122 @@ async function sendQueuedMessage(payload) {
   };
 }
 
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: HEADLESS,
-    executablePath: detectChromeExecutablePath(),
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu'
-    ]
+function createWhatsAppClient() {
+  const createdClient = new Client({
+    authStrategy: new LocalAuth(),
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
+    puppeteer: {
+      headless: HEADLESS,
+      executablePath: detectChromeExecutablePath(),
+      timeout: PUPPETEER_NAVIGATION_TIMEOUT_MS,
+      protocolTimeout: PUPPETEER_NAVIGATION_TIMEOUT_MS,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-default-apps',
+        '--hide-scrollbars',
+        '--mute-audio'
+      ]
+    }
+  });
+
+  createdClient.on('qr', async (qr) => {
+    lastQr = qr;
+    lastQrDataUrl = await QRCode.toDataURL(qr);
+    clientReady = false;
+    lastState = 'qr';
+    lastError = null;
+
+    console.log('\nEscaneie este QR Code com o WhatsApp:');
+    qrcodeTerminal.generate(qr, { small: true });
+    console.log(`\nTambem disponivel em http://${HOST}:${PORT}/qr\n`);
+  });
+
+  createdClient.on('authenticated', () => {
+    authenticatedAt = new Date().toISOString();
+    lastQr = null;
+    lastQrDataUrl = null;
+    lastState = 'authenticated';
+    lastError = null;
+    console.log('WhatsApp autenticado.');
+
+    setTimeout(syncClientState, 5000);
+  });
+
+  createdClient.on('ready', () => {
+    initializing = false;
+    initializeAttempts = 0;
+    clientReady = true;
+    lastQr = null;
+    lastQrDataUrl = null;
+    readyAt = new Date().toISOString();
+    lastState = 'ready';
+    lastError = null;
+    console.log('WhatsApp conectado e pronto para enviar mensagens.');
+  });
+
+  createdClient.on('loading_screen', (percent, message) => {
+    lastState = 'loading';
+    console.log(`WhatsApp loading ${percent}%: ${message}`);
+  });
+
+  createdClient.on('change_state', (state) => {
+    lastClientState = state;
+    console.log('WhatsApp state:', state);
+  });
+
+  createdClient.on('auth_failure', (message) => {
+    initializing = false;
+    clientReady = false;
+    lastState = 'auth_failure';
+    lastError = message || 'Falha de autenticacao.';
+    console.error('Falha de autenticacao:', lastError);
+  });
+
+  createdClient.on('disconnected', (reason) => {
+    initializing = false;
+    clientReady = false;
+    lastState = 'disconnected';
+    lastError = reason || null;
+    console.warn('WhatsApp desconectado:', reason);
+  });
+
+  return createdClient;
+}
+
+async function syncClientState() {
+  if (!client) {
+    return null;
   }
-});
 
-client.on('qr', async (qr) => {
-  lastQr = qr;
-  lastQrDataUrl = await QRCode.toDataURL(qr);
-  clientReady = false;
-  lastState = 'qr';
-  lastError = null;
+  try {
+    const state = await client.getState();
+    lastClientState = state;
 
-  console.log('\nEscaneie este QR Code com o WhatsApp:');
-  qrcodeTerminal.generate(qr, { small: true });
-  console.log(`\nTambÃ©m disponÃ­vel em http://${HOST}:${PORT}/qr\n`);
-});
+    if (state === 'CONNECTED') {
+      clientReady = true;
+      initializing = false;
+      lastQr = null;
+      lastQrDataUrl = null;
+      readyAt = readyAt || new Date().toISOString();
+      lastState = 'ready';
+    }
 
-client.on('authenticated', () => {
-  authenticatedAt = new Date().toISOString();
-  lastState = 'authenticated';
-  lastError = null;
-  console.log('WhatsApp autenticado.');
-});
-
-client.on('ready', () => {
-  clientReady = true;
-  lastQr = null;
-  lastQrDataUrl = null;
-  readyAt = new Date().toISOString();
-  lastState = 'ready';
-  lastError = null;
-  console.log('WhatsApp conectado e pronto para enviar mensagens.');
-});
-
-client.on('auth_failure', (message) => {
-  clientReady = false;
-  lastState = 'auth_failure';
-  lastError = message || 'Falha de autenticaÃ§Ã£o.';
-  console.error('Falha de autenticaÃ§Ã£o:', lastError);
-});
-
-client.on('disconnected', (reason) => {
-  clientReady = false;
-  lastState = 'disconnected';
-  lastError = reason || null;
-  console.warn('WhatsApp desconectado:', reason);
-});
+    return state;
+  } catch (error) {
+    lastError = error.message;
+    return null;
+  }
+}
 
 function shouldRetryInitialize(error) {
   const message = String(error?.message || '');
@@ -289,8 +351,61 @@ function shouldRetryInitialize(error) {
     'Most likely because of a navigation',
     'Target closed',
     'Protocol error',
-    'Navigation timeout'
+    'Navigation timeout',
+    'initialize timeout',
+    'TimeoutError'
   ].some((pattern) => message.includes(pattern));
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
+
+async function destroyCurrentClient() {
+  if (!client) {
+    return;
+  }
+
+  try {
+    if (client.pupBrowser) {
+      await client.pupBrowser.close();
+    }
+  } catch (_error) {
+    // Best effort: the browser may already be gone.
+  }
+
+  try {
+    await client.destroy();
+  } catch (_error) {
+    // Best effort: a failed Puppeteer instance may already be closed.
+  } finally {
+    client = null;
+  }
+}
+
+function cleanupChromiumSingletonLocks() {
+  const sessionPath = './.wwebjs_auth/session';
+  const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+
+  for (const file of lockFiles) {
+    const fullPath = `${sessionPath}/${file}`;
+    try {
+      if (fs.existsSync(fullPath)) {
+        fs.rmSync(fullPath, { force: true });
+      }
+    } catch (_error) {
+      // Best effort: if Linux still owns the socket/lock, the next retry will report it.
+    }
+  }
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function initializeClientWithRetry() {
@@ -303,13 +418,16 @@ function initializeClientWithRetry() {
   lastState = 'initializing';
 
   console.log(`Inicializando cliente WhatsApp... tentativa ${initializeAttempts}`);
+  client = createWhatsAppClient();
 
-  client.initialize().catch((error) => {
+  withTimeout(client.initialize(), WA_INITIALIZE_TIMEOUT_MS, 'WhatsApp initialize').catch(async (error) => {
     clientReady = false;
     initializing = false;
     lastState = 'initialize_error';
     lastError = error.message;
     console.error('Falha ao inicializar WhatsApp:', error);
+    await destroyCurrentClient();
+    cleanupChromiumSingletonLocks();
 
     if (!shouldRetryInitialize(error)) {
       return;
@@ -317,7 +435,11 @@ function initializeClientWithRetry() {
 
     const delayMs = Math.min(30000, 5000 * initializeAttempts);
     console.log(`Tentando inicializar novamente em ${delayMs / 1000}s...`);
-    setTimeout(initializeClientWithRetry, delayMs);
+    setTimeout(async () => {
+      await wait(1000);
+      cleanupChromiumSingletonLocks();
+      initializeClientWithRetry();
+    }, delayMs);
   });
 }
 
@@ -367,6 +489,11 @@ app.get('/', (req, res) => {
 
 app.get('/status', (req, res) => {
   res.json(publicStatus());
+});
+
+app.post('/sync-state', async (req, res) => {
+  const state = await syncClientState();
+  res.json({ ok: true, state, status: publicStatus() });
 });
 
 app.get('/qr', (req, res) => {
