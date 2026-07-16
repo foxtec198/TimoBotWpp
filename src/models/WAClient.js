@@ -4,60 +4,87 @@ const path = require("path");
 const fs = require("fs");
 
 class WAClient {
-  constructor(headless = true, id) {
+  constructor(headless = true, id = "tm-bot") {
     this.whatsappReady = false;
-    const clientOptions = {
-      authStrategy: new LocalAuth(),
+
+    this.client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: id
+      }),
+
       puppeteer: {
-        headless: headless,
-        executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        headless,
         args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--disable-gpu',
-          '--disable-extensions',
-          '--disable-background-networking',
-          '--disable-sync',
-          '--disable-default-apps',
-          '--hide-scrollbars',
-          '--mute-audio'
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu"
         ]
       }
-    };
-
-    // Create a new client instance
-    const client = new Client(clientOptions);
-
-    // When the client is ready, run this code (only once)
-    client.once('ready', () => {
-      this.whatsappReady = true
-      console.log('Whatsapp connectado e pronto!!');
     });
 
-    // Gera o QRCode
-    client.on('qr', qr => {
-      return qrcode.generate(qr, { small: true });
+    this.registerEvents();
+
+    console.log("Inicializando WhatsApp...");
+
+    this.client.initialize().catch((error) => {
+      console.error("Erro no initialize:", error);
+    });
+  };
+
+  registerEvents() {
+    this.client.on("qr", (qr) => {
+      console.log("QR Code recebido");
+
+      qrcode.generate(qr, {
+        small: true
+      });
     });
 
-    client.on("disconnected", (reason) => {
-      this.whatsappReady = false;
-      console.log("WhatsApp desconectado:", reason);
+    this.client.on("authenticated", () => {
+      console.log("WhatsApp autenticado com sucesso!");
     });
 
-    client.on("auth_failure", (error) => {
+    this.client.on("loading_screen", (percent, message) => {
+      console.log(
+        `Carregando WhatsApp: ${percent}% - ${message}`
+      );
+    });
+
+    this.client.on("change_state", (state) => {
+      console.log("Estado alterado:", state);
+    });
+
+    this.client.on("ready", async () => {
+      this.whatsappReady = true;
+
+      console.log("WhatsApp conectado e pronto!");
+
+      try {
+        const state = await this.client.getState();
+        console.log("Estado atual:", state);
+        console.log(
+          "Conta conectada:",
+          this.client.info?.wid?._serialized
+        );
+      } catch (error) {
+        console.error(
+          "Erro ao consultar estado:",
+          error.message
+        );
+      }
+    });
+
+    this.client.on("auth_failure", (error) => {
       this.whatsappReady = false;
       console.error("Falha na autenticação:", error);
     });
 
-    // Inicializa o cliente
-    client.initialize();
-
-    this.client = client;
-  };
+    this.client.on("disconnected", (reason) => {
+      this.whatsappReady = false;
+      console.error("WhatsApp desconectado:", reason);
+    });
+  }
 
   async createMessageMedia(image) {
     if (!image) {
