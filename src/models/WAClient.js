@@ -12,8 +12,15 @@ class WAClient {
         clientId: id
       }),
 
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/146.0.0.0 Safari/537.36",
+
+      authTimeoutMs: 120000,
       puppeteer: {
-        headless,
+        headless: headless,
+        protocolTimeout: 120000,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
