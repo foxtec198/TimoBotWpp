@@ -164,10 +164,12 @@ class WAClient {
     }
 
     return {
-      messageId: result.id._serialized,
+      sent: true,
+      confirmed: Boolean(result?.id),
+      messageId: result?.id?._serialized ?? null,
       destination: chatId,
       type: image ? "image" : "text",
-      timestamp: result.timestamp
+      timestamp: result?.timestamp ?? Date.now()
     };
   };
 
