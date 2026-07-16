@@ -1,21 +1,9 @@
-﻿let Queue;
-let Worker;
-let QueueEvents;
-let IORedis;
-
-try {
-  ({ Queue, Worker, QueueEvents } = require('bullmq'));
-  IORedis = require('ioredis');
-} catch (_error) {
-  Queue = null;
-  Worker = null;
-  QueueEvents = null;
-  IORedis = null;
-}
+﻿const { Queue, Worker, QueueEvents } = require('bullmq')
+const IORedis = require("ioredis");
 
 const QUEUE_NAME = process.env.MESSAGE_QUEUE_NAME || 'whatsapp-messages';
 const REDIS_URL = process.env.REDIS_URL || '';
-const QUEUE_DRIVER = String(process.env.QUEUE_DRIVER || 'auto').toLowerCase();
+const QUEUE_DRIVER = String(process.env.QUEUE_DRIVER || 'memory').toLowerCase();
 const CONCURRENCY = Number(process.env.MESSAGE_QUEUE_CONCURRENCY || 1);
 
 let mode = 'memory';
@@ -28,14 +16,13 @@ const memoryQueue = [];
 let memoryRunning = false;
 
 function canUseRedis() {
-  if (QUEUE_DRIVER === 'memory') {
-    return false;
-  }
+  // Confirma se vai rodar em memoria
+  if (QUEUE_DRIVER === 'memory') { return false; }
 
-  if (QUEUE_DRIVER === 'redis' && !REDIS_URL) {
-    throw new Error('QUEUE_DRIVER=redis exige REDIS_URL configurado.');
-  }
+  // Retorna erro caso nao encontre a URL do redis
+  if (QUEUE_DRIVER === 'redis' && !REDIS_URL) { throw new Error('QUEUE_DRIVER=redis exige REDIS_URL configurado.'); }
 
+  // Retorna TRUE caso todos parametros passem
   return Boolean(REDIS_URL && Queue && Worker && QueueEvents && IORedis);
 }
 

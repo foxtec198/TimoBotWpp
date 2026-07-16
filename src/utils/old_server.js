@@ -1,0 +1,663 @@
+﻿require('dotenv').config();
+
+const cors = require('cors');
+const express = require('express');
+const fs = require('fs');
+const QRCode = require('qrcode');
+const qrcodeTerminal = require('qrcode-terminal');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const {
+  enqueueMessage,
+  getMessageJob,
+  getQueueStatus,
+  initMessageQueue
+} = require('./queue/messageQueue');
+
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '127.0.0.1';
+const API_KEY = process.env.API_KEY || '';
+const HEADLESS = String(process.env.PUPPETEER_HEADLESS || 'true') !== 'false';
+const WA_INITIALIZE_TIMEOUT_MS = Number(process.env.WA_INITIALIZE_TIMEOUT_MS || 90000);
+const PUPPETEER_NAVIGATION_TIMEOUT_MS = Number(process.env.PUPPETEER_NAVIGATION_TIMEOUT_MS || 120000);
+const WA_AUTH_TIMEOUT_MS = Number(process.env.WA_AUTH_TIMEOUT_MS || 120000);
+const WA_LOADING_100_WATCHDOG_MS = Number(process.env.WA_LOADING_100_WATCHDOG_MS || 15000);
+const WA_WEB_VERSION = process.env.WA_WEB_VERSION || '';
+const WA_WEB_VERSION_CACHE = process.env.WA_WEB_VERSION_CACHE || '';
+const WA_WEB_VERSION_REMOTE_PATH = process.env.WA_WEB_VERSION_REMOTE_PATH || 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html';
+
+function detectChromeExecutablePath() {
+  const configured = process.env.CHROME_EXECUTABLE_PATH;
+  if (configured && fs.existsSync(configured)) {
+    return configured;
+  }
+
+  if (process.platform !== 'win32') {
+    return undefined;
+  }
+
+  const candidates = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+const app = express();
+
+let clientReady = false;
+let lastQr = null;
+let lastQrDataUrl = null;
+let lastState = 'starting';
+let authenticatedAt = null;
+let readyAt = null;
+let lastError = null;
+let lastClientState = null;
+let lastLoadingPercent = null;
+let lastLoadingMessage = null;
+let initializeAttempts = 0;
+let initializing = false;
+let client = null;
+let loadingWatchdog = null;
+
+app.use(cors());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
+
+// function requireApiKey(req, res, next) {
+//   if (!API_KEY) { return next(); }
+
+//   const token = req.get('x-api-key') || req.query.api_key;
+//   if (token !== API_KEY) {
+//     return res.status(401).json({ ok: false, error: 'API key invÃ¡lida ou ausente.' });
+//   }
+
+//   return next();
+// }
+
+function normalizePhoneNumber(value) {
+  if (!value) {
+    return null;
+  }
+
+  const onlyDigits = String(value).replace(/\D/g, '');
+  return onlyDigits || null;
+}
+
+function buildChatId(to) {
+  const value = String(to || '').trim();
+  if (value.endsWith('@c.us') || value.endsWith('@g.us')) {
+    return value;
+  }
+
+  const phone = normalizePhoneNumber(value);
+  return phone ? `${phone}@c.us` : null;
+}
+
+async function resolveChatId(to) {
+  const value = String(to || '').trim();
+  if (!value) {
+    return null;
+  }
+
+  if (value.endsWith('@g.us')) {
+    return value;
+  }
+
+  if (value.endsWith('@c.us')) {
+    const phone = value.replace('@c.us', '');
+    const numberId = await client.getNumberId(phone);
+    return numberId?._serialized || null;
+  }
+
+  const phone = normalizePhoneNumber(value);
+  if (!phone) {
+    return null;
+  }
+
+  const numberId = await client.getNumberId(phone);
+  return numberId?._serialized || null;
+}
+
+function publicStatus() {
+  return {
+    ok: true,
+    connected: clientReady,
+    state: lastState,
+    hasQr: Boolean(lastQr),
+    authenticatedAt,
+    readyAt,
+    lastClientState,
+    lastLoadingPercent,
+    lastLoadingMessage,
+    lastError
+  };
+}
+
+function normalizeImagePayload({ image, imageUrl, imageBase64, imagePath, caption }) {
+  if (image && typeof image === 'object') {
+    return {
+      url: image.url || null,
+      path: image.path || null,
+      base64: image.base64 || null,
+      mimetype: image.mimetype || image.mimeType || null,
+      filename: image.filename || image.fileName || null,
+      caption: image.caption || caption || null
+    };
+  }
+
+  if (imageUrl) {
+    return { url: imageUrl, caption: caption || null };
+  }
+
+  if (imagePath) {
+    return { path: imagePath, caption: caption || null };
+  }
+
+  if (imageBase64) {
+    return {
+      base64: imageBase64,
+      mimetype: 'image/jpeg',
+      filename: 'image.jpg',
+      caption: caption || null
+    };
+  }
+
+  return null;
+}
+
+function extractMessagePayload(body) {
+  const { to, numero, phone, message, mensagem, text, image, imageUrl, imageBase64, imagePath, caption } = body || {};
+
+  return {
+    destination: to || numero || phone,
+    text: message || mensagem || text || caption || '',
+    image: normalizeImagePayload({ image, imageUrl, imageBase64, imagePath, caption })
+  };
+}
+
+async function buildMedia(image) {
+  if (!image) {
+    return null;
+  }
+
+  if (image.url) {
+    return MessageMedia.fromUrl(image.url);
+  }
+
+  if (image.path) {
+    return MessageMedia.fromFilePath(image.path);
+  }
+
+  if (image.base64) {
+    const cleanBase64 = String(image.base64).replace(/^data:[^;]+;base64,/, '');
+    return new MessageMedia(
+      image.mimetype || 'image/jpeg',
+      cleanBase64,
+      image.filename || 'image.jpg'
+    );
+  }
+
+  return null;
+}
+
+async function sendQueuedMessage(payload) {
+  if (!clientReady) {
+    throw new Error('WhatsApp ainda nÃ£o estÃ¡ conectado.');
+  }
+
+  const chatId = await resolveChatId(payload.destination);
+  if (!chatId) {
+    throw new Error('NÃºmero nÃ£o encontrado no WhatsApp ou nÃ£o resolvido pelo WhatsApp Web.');
+  }
+
+  const media = await buildMedia(payload.image);
+  const text = String(payload.text || '');
+
+  if (media) {
+    const result = await client.sendMessage(chatId, media, {
+      caption: payload.image?.caption || text || undefined
+    });
+    return {
+      to: chatId,
+      sent: true,
+      media: true,
+      messageId: result?.id?._serialized || null
+    };
+  }
+
+  const result = await client.sendMessage(chatId, text);
+  return {
+    to: chatId,
+    sent: true,
+    media: false,
+    messageId: result?.id?._serialized || null
+  };
+}
+
+function createWhatsAppClient() {
+  const clientOptions = {
+    authStrategy: new LocalAuth(),
+    authTimeoutMs: WA_AUTH_TIMEOUT_MS,
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
+    puppeteer: {
+      headless: HEADLESS,
+      executablePath: detectChromeExecutablePath(),
+      timeout: PUPPETEER_NAVIGATION_TIMEOUT_MS,
+      protocolTimeout: PUPPETEER_NAVIGATION_TIMEOUT_MS,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-default-apps',
+        '--hide-scrollbars',
+        '--mute-audio'
+      ]
+    }
+  };
+
+  if (WA_WEB_VERSION) {
+    clientOptions.webVersion = WA_WEB_VERSION;
+  }
+
+  if (WA_WEB_VERSION_CACHE === 'remote') {
+    clientOptions.webVersionCache = {
+      type: 'remote',
+      remotePath: WA_WEB_VERSION_REMOTE_PATH,
+      strict: false
+    };
+  } else if (WA_WEB_VERSION_CACHE === 'local') {
+    clientOptions.webVersionCache = {
+      type: 'local'
+    };
+  }
+
+  const createdClient = new Client(clientOptions);
+
+  createdClient.on('qr', async (qr) => {
+    lastQr = qr;
+    lastQrDataUrl = await QRCode.toDataURL(qr);
+    clientReady = false;
+    lastState = 'qr';
+    lastError = null;
+
+    console.log('\nEscaneie este QR Code com o WhatsApp:');
+    qrcodeTerminal.generate(qr, { small: true });
+    console.log(`\nTambem disponivel em http://${HOST}:${PORT}/qr\n`);
+  });
+
+  createdClient.on('authenticated', () => {
+    authenticatedAt = new Date().toISOString();
+    lastQr = null;
+    lastQrDataUrl = null;
+    lastState = 'authenticated';
+    lastError = null;
+    console.log('WhatsApp autenticado.');
+
+    setTimeout(syncClientState, 5000);
+  });
+
+  createdClient.on('ready', () => {
+    clearLoadingWatchdog();
+    initializing = false;
+    initializeAttempts = 0;
+    clientReady = true;
+    lastQr = null;
+    lastQrDataUrl = null;
+    readyAt = new Date().toISOString();
+    lastState = 'ready';
+    lastError = null;
+    console.log('WhatsApp conectado e pronto para enviar mensagens.');
+  });
+
+  createdClient.on('loading_screen', (percent, message) => {
+    lastState = 'loading';
+    lastLoadingPercent = percent;
+    lastLoadingMessage = message;
+    console.log(`WhatsApp loading ${percent}%: ${message}`);
+
+    if (Number(percent) >= 100) {
+      scheduleLoadingWatchdog();
+    }
+  });
+
+  createdClient.on('change_state', (state) => {
+    lastClientState = state;
+    console.log('WhatsApp state:', state);
+  });
+
+  createdClient.on('auth_failure', (message) => {
+    initializing = false;
+    clientReady = false;
+    lastState = 'auth_failure';
+    lastError = message || 'Falha de autenticacao.';
+    console.error('Falha de autenticacao:', lastError);
+  });
+
+  createdClient.on('disconnected', (reason) => {
+    initializing = false;
+    clientReady = false;
+    lastState = 'disconnected';
+    lastError = reason || null;
+    console.warn('WhatsApp desconectado:', reason);
+  });
+
+  return createdClient;
+}
+
+function clearLoadingWatchdog() {
+  if (loadingWatchdog) {
+    clearTimeout(loadingWatchdog);
+    loadingWatchdog = null;
+  }
+}
+
+function scheduleLoadingWatchdog() {
+  clearLoadingWatchdog();
+  loadingWatchdog = setTimeout(async () => {
+    const state = await syncClientState();
+    console.log('Watchdog WhatsApp loading 100%, state:', state);
+
+    if (clientReady) {
+      return;
+    }
+
+    initializing = false;
+    lastState = 'loading_timeout';
+    lastError = `WhatsApp ficou em loading 100% por ${WA_LOADING_100_WATCHDOG_MS}ms`;
+    await destroyCurrentClient();
+    cleanupChromiumSingletonLocks();
+    setTimeout(initializeClientWithRetry, 5000);
+  }, WA_LOADING_100_WATCHDOG_MS);
+}
+
+async function syncClientState() {
+  if (!client) {
+    return null;
+  }
+
+  try {
+    const state = await client.getState();
+    lastClientState = state;
+
+    if (state === 'CONNECTED') {
+      clientReady = true;
+      initializing = false;
+      lastQr = null;
+      lastQrDataUrl = null;
+      readyAt = readyAt || new Date().toISOString();
+      lastState = 'ready';
+    }
+
+    return state;
+  } catch (error) {
+    lastError = error.message;
+    return null;
+  }
+}
+
+function shouldRetryInitialize(error) {
+  const message = String(error?.message || '');
+
+  return [
+    'Execution context was destroyed',
+    'Most likely because of a navigation',
+    'Target closed',
+    'Protocol error',
+    'Navigation timeout',
+    'initialize timeout',
+    'TimeoutError'
+  ].some((pattern) => message.includes(pattern));
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
+
+async function destroyCurrentClient() {
+  clearLoadingWatchdog();
+  if (!client) {
+    return;
+  }
+
+  try {
+    if (client.pupBrowser) {
+      await client.pupBrowser.close();
+    }
+  } catch (_error) {
+    // Best effort: the browser may already be gone.
+  }
+
+  try {
+    await client.destroy();
+  } catch (_error) {
+    // Best effort: a failed Puppeteer instance may already be closed.
+  } finally {
+    client = null;
+  }
+}
+
+function cleanupChromiumSingletonLocks() {
+  const sessionPath = './.wwebjs_auth/session';
+  const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+
+  for (const file of lockFiles) {
+    const fullPath = `${sessionPath}/${file}`;
+    try {
+      if (fs.existsSync(fullPath)) {
+        fs.rmSync(fullPath, { force: true });
+      }
+    } catch (_error) {
+      // Best effort: if Linux still owns the socket/lock, the next retry will report it.
+    }
+  }
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function initializeClientWithRetry() {
+  if (initializing || clientReady) { return }
+
+  initializing = true;
+  initializeAttempts += 1;
+  lastState = 'initializing';
+
+  console.log(`Inicializando cliente WhatsApp... tentativa ${initializeAttempts}`);
+  client = createWhatsAppClient();
+
+  withTimeout(client.initialize(), WA_INITIALIZE_TIMEOUT_MS, 'WhatsApp initialize').catch(async (error) => {
+    clientReady = false;
+    initializing = false;
+    lastState = 'initialize_error';
+    lastError = error.message;
+    console.error('Falha ao inicializar WhatsApp:', error);
+
+    if (authenticatedAt || Number(lastLoadingPercent) >= 100) {
+      console.log('Falha ocorreu apos autenticacao/loading. Aguardando estado estabilizar antes do retry...');
+      await wait(8000);
+      const state = await syncClientState();
+      console.log('Estado apos falha de initialize:', state);
+
+      if (clientReady) {
+        return;
+      }
+    }
+
+    await destroyCurrentClient();
+    cleanupChromiumSingletonLocks();
+
+    if (!shouldRetryInitialize(error)) {
+      return;
+    }
+
+    const delayMs = Math.min(30000, 5000 * initializeAttempts);
+    console.log(`Tentando inicializar novamente em ${delayMs / 1000}s...`);
+    setTimeout(async () => {
+      await wait(1000);
+      cleanupChromiumSingletonLocks();
+      initializeClientWithRetry();
+    }, delayMs);
+  });
+}
+
+app.get('/', (req, res) => {
+  const status = publicStatus();
+
+  if (status.connected) {
+    return res.type('html').send(`
+      <!doctype html>
+      <html lang="pt-BR">
+        <head><meta charset="utf-8"><title>WhatsApp Listener</title></head>
+        <body>
+          <h1>WhatsApp conectado</h1>
+          <pre>${JSON.stringify(status, null, 2)}</pre>
+        </body>
+      </html>
+    `);
+  }
+
+  if (lastQrDataUrl) {
+    return res.type('html').send(`
+      <!doctype html>
+      <html lang="pt-BR">
+        <head><meta charset="utf-8"><title>Conectar WhatsApp</title></head>
+        <body>
+          <h1>Conectar WhatsApp</h1>
+          <p>Escaneie o QR Code abaixo ou use o QR exibido no terminal.</p>
+          <img src="${lastQrDataUrl}" alt="QR Code do WhatsApp" width="320" height="320">
+          <pre>${JSON.stringify(status, null, 2)}</pre>
+        </body>
+      </html>
+    `);
+  }
+
+  return res.type('html').send(`
+    <!doctype html>
+    <html lang="pt-BR">
+      <head><meta charset="utf-8"><title>WhatsApp Listener</title></head>
+      <body>
+        <h1>WhatsApp iniciando</h1>
+        <p>Aguardando geraÃ§Ã£o do QR Code. Recarregue esta pÃ¡gina em alguns segundos.</p>
+        <pre>${JSON.stringify(status, null, 2)}</pre>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/status', (req, res) => {
+  res.json(publicStatus());
+});
+
+app.post('/sync-state', async (req, res) => {
+  const state = await syncClientState();
+  res.json({ ok: true, state, status: publicStatus() });
+});
+
+app.get('/qr', (req, res) => {
+  if (!lastQr) {
+    return res.status(clientReady ? 409 : 404).json({
+      ok: false,
+      connected: clientReady,
+      error: clientReady ? 'WhatsApp jÃ¡ estÃ¡ conectado.' : 'QR Code ainda nÃ£o foi gerado.'
+    });
+  }
+
+  const format = String(req.query.format || 'json').toLowerCase();
+  if (format === 'image') {
+    return res.type('html').send(`<img src="${lastQrDataUrl}" alt="QR Code do WhatsApp">`);
+  }
+  if (format === 'raw') {
+    return res.type('text').send(lastQr);
+  }
+
+  return res.json({ ok: true, qr: lastQr, qrDataUrl: lastQrDataUrl });
+});
+
+app.post(['/send', '/enviar'], async (req, res) => {
+  const { destination, text, image } = extractMessagePayload(req.body);
+
+  if (!buildChatId(destination)) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Informe o destino em "to", "numero" ou "phone". Exemplo: 5511999999999.'
+    });
+  }
+
+  if ((!text || !String(text).trim()) && !image) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Informe texto em "message", "mensagem" ou "text", ou imagem em "image", "imageUrl", "imagePath" ou "imageBase64".'
+    });
+  }
+
+  try {
+    const job = await enqueueMessage({
+      destination,
+      text,
+      image,
+      requestedAt: new Date().toISOString()
+    });
+
+    return res.status(202).json({
+      ok: true,
+      queued: true,
+      persistent: job.persistent,
+      queueMode: job.mode,
+      jobId: job.id
+    });
+  } catch (error) {
+    lastError = error.message;
+    return res.status(500).json({
+      ok: false,
+      error: 'Falha ao adicionar mensagem na fila.',
+      details: error.message
+    });
+  }
+});
+
+app.get('/queue', async (req, res) => {
+  try {
+    return res.json({ ok: true, status: await getQueueStatus() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/queue/:id', async (req, res) => {
+  try {
+    const job = await getMessageJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ ok: false, error: 'Job nÃ£o encontrado.' });
+    }
+    return res.json({ ok: true, job });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'Rota não encontrada.' });
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`Servidor HTTP rodando em http://${HOST}:${PORT}`);
+  initMessageQueue(sendQueuedMessage);
+  initializeClientWithRetry();
+});
