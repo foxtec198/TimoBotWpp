@@ -1,6 +1,6 @@
-# TMBot
+# Timo Bot | Wpp
 
-Automatic Robotic Process for TMHub.
+An ChatBot for TMHub.
 
 Este diretório raiz é o bot WhatsApp em Node.js usando `whatsapp-web.js`.
 
